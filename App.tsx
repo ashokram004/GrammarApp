@@ -1,1278 +1,382 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  ActivityIndicator,
-  TextInput,
-  TouchableOpacity,
-  Text,
-  View,
-} from "react-native";
+import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { WebView } from "react-native-webview";
-import { MaterialIcons } from "@expo/vector-icons";
+import WebView from "react-native-webview";
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { usePreventScreenCapture } from "expo-screen-capture";
 import * as FileSystem from "expo-file-system/legacy";
 
-export default function App() {
-  usePreventScreenCapture();
+const PDF_URL = "https://drive.google.com/uc?export=download&id=1ttnTzgZEobC2_zmWLvhL7AKiNbgRh-P5";
 
-  const [documentUri, setDocumentUri] = useState("");
-  const [loadError, setLoadError] = useState("");
+function createViewerHtml(pdfUri: string) {
+  return `<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,user-scalable=yes">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/web/pdf_viewer.css">
+<style>
+html, body {
+  margin: 0;
+  background: #e8e8e8;
+  -webkit-text-size-adjust: 100% !important;
+  text-size-adjust: 100% !important;
+}
+#viewerContainer { position: absolute; inset: 0; overflow: auto; }
+#viewer { padding: 8px 0 24px; }
+.pdfViewer .page { margin: 10px auto; background: #fff; box-shadow: 0 1px 4px #555; position: relative; }
+
+.custom-highlight {
+  position: absolute;
+  background-color: rgba(255, 235, 59, 0.4);
+  pointer-events: none;
+  border-radius: 2px;
+  z-index: 10;
+}
+.custom-highlight.active {
+  background-color: rgba(255, 152, 0, 0.5);
+  border: 2px solid rgba(220, 100, 0, 0.8);
+  z-index: 11;
+}
+.error, .loading { padding: 32px; text-align: center; }
+.error { color: #b00020; }
+</style>
+</head>
+<body>
+<div id="viewerContainer"><div id="viewer" class="pdfViewer"></div></div>
+<script type="module">
+import { getDocument, GlobalWorkerOptions } from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
+import { EventBus, PDFLinkService, PDFViewer } from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/web/pdf_viewer.mjs";
+
+GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+const container = document.getElementById("viewerContainer");
+const eventBus = new EventBus();
+const linkService = new PDFLinkService({ eventBus });
+
+const pdfViewer = new PDFViewer({
+  container,
+  eventBus,
+  linkService,
+  textLayerMode: 0, 
+  removePageBorders: true
+});
+linkService.setViewer(pdfViewer);
+
+let customSearchIndex = [];
+let currentMatches = [];
+let activeMatchIndex = -1;
+let pdfDoc = null;
+
+// Hidden canvas to measure proportional character widths accurately
+const measureCanvas = document.createElement('canvas');
+const measureCtx = measureCanvas.getContext('2d');
+measureCtx.font = '16px sans-serif'; 
+
+function send(type, data) {
+  if (window.ReactNativeWebView) {
+    window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...(data || {}) }));
+  }
+}
+
+async function buildSearchIndex(pdf) {
+  customSearchIndex = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    
+    let pageString = "";
+    let mapping = [];
+
+    // 1. Sort text chunks visually (Top to Bottom, then Left to Right)
+    const sortedItems = textContent.items.slice().sort((a, b) => {
+      const yDiff = b.transform[5] - a.transform[5];
+      // If Y difference is greater than 5 points, they are on different lines
+      if (Math.abs(yDiff) > 5) return b.transform[5] - a.transform[5];
+      // Otherwise, sort by X coordinate (Left to Right)
+      return a.transform[4] - b.transform[4];
+    });
+
+    sortedItems.forEach(item => {
+      const text = item.str;
+      const height = item.height || Math.abs(item.transform[3]);
+      
+      // Calculate relative width ratios using canvas
+      const totalEstWidth = measureCtx.measureText(text).width;
+      const widthScale = totalEstWidth === 0 ? 0 : item.width / totalEstWidth;
+
+      let currentX = item.transform[4];
+      const currentY = item.transform[5];
+
+      for (let c = 0; c < text.length; c++) {
+        const char = text[c];
+        const charWidth = measureCtx.measureText(char).width * widthScale;
+
+        if (char.trim().length > 0 && char !== '\\u200B' && char !== '\\u200D') {
+          pageString += char;
+          mapping.push({
+            x: currentX,
+            y: currentY,
+            width: charWidth,
+            height: height
+          });
+        }
+        currentX += charWidth;
+      }
+    });
+    customSearchIndex.push({ pageNum: i, searchableText: pageString, mapping });
+  }
+}
+
+eventBus.on("pagerendered", (e) => {
+  drawHighlightsForPage(e.pageNumber);
+});
+
+eventBus.on("pagesinit", () => {
+  pdfViewer.currentScaleValue = "page-width";
+});
+
+async function render() {
+  try {
+    pdfDoc = await getDocument({ 
+      url: ${JSON.stringify(pdfUri)},
+      cMapUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/cmaps/",
+      cMapPacked: true
+    }).promise;
+    
+    pdfViewer.setDocument(pdfDoc);
+    await buildSearchIndex(pdfDoc);
+    
+    send("pdf-ready", { pages: pdfDoc.numPages });
+  } catch (error) {
+    send("pdf-error", { message: String(error) });
+  }
+}
+
+window.search = (query) => {
+  currentMatches = [];
+  activeMatchIndex = -1;
+  document.querySelectorAll('.custom-highlight').forEach(e => e.remove());
+
+  if (!query) {
+     send("search", { current: 0, total: 0 });
+     return;
+  }
+
+  const normalizedQuery = String(query).replace(/[\\s\\u200B-\\u200D]/g, "");
+  if (!normalizedQuery) return;
+
+  customSearchIndex.forEach((pageData) => {
+    let startIndex = 0;
+    let matchIdx;
+    
+    while ((matchIdx = pageData.searchableText.indexOf(normalizedQuery, startIndex)) > -1) {
+      let matchRects = [];
+      let currentRect = null;
+
+      // Group highlights by line to prevent giant screen-covering boxes
+      for (let i = 0; i < normalizedQuery.length; i++) {
+        const charBox = pageData.mapping[matchIdx + i];
+        if (!currentRect) {
+          currentRect = { x: charBox.x, y: charBox.y, width: charBox.width, height: charBox.height };
+        } else {
+          // If the character is on the same line (Y diff < 5)
+          if (Math.abs(currentRect.y - charBox.y) < 5) {
+            const newMaxX = Math.max(currentRect.x + currentRect.width, charBox.x + charBox.width);
+            currentRect.x = Math.min(currentRect.x, charBox.x);
+            currentRect.width = newMaxX - currentRect.x;
+            currentRect.height = Math.max(currentRect.height, charBox.height);
+          } else {
+            // New line, save the old rect and start a new one
+            matchRects.push(currentRect);
+            currentRect = { x: charBox.x, y: charBox.y, width: charBox.width, height: charBox.height };
+          }
+        }
+      }
+      if (currentRect) matchRects.push(currentRect);
+
+      currentMatches.push({
+        pageNum: pageData.pageNum,
+        rects: matchRects
+      });
+      startIndex = matchIdx + 1;
+    }
+  });
+
+  if (currentMatches.length > 0) {
+    activeMatchIndex = 0;
+    highlightCurrentMatch();
+  } else {
+    send("search", { current: 0, total: 0 });
+  }
+};
+
+window.nextMatch = () => {
+  if (currentMatches.length === 0) return;
+  activeMatchIndex = (activeMatchIndex + 1) % currentMatches.length;
+  highlightCurrentMatch();
+};
+
+window.prevMatch = () => {
+  if (currentMatches.length === 0) return;
+  activeMatchIndex = (activeMatchIndex - 1 + currentMatches.length) % currentMatches.length;
+  highlightCurrentMatch();
+};
+
+function highlightCurrentMatch() {
+  send("search", { current: activeMatchIndex + 1, total: currentMatches.length });
+  
+  const match = currentMatches[activeMatchIndex];
+  if (!match) return;
+
+  if (pdfViewer.currentPageNumber !== match.pageNum) {
+    pdfViewer.currentPageNumber = match.pageNum;
+  }
+  drawHighlightsForPage(match.pageNum);
+}
+
+function drawHighlightsForPage(pageNum) {
+  const pageView = pdfViewer.getPageView(pageNum - 1);
+  if (!pageView || !pageView.div) return;
+  
+  pageView.div.querySelectorAll('.custom-highlight').forEach(e => e.remove());
+
+  const pageMatches = currentMatches
+    .map((m, index) => ({...m, index}))
+    .filter(m => m.pageNum === pageNum);
+    
+  if (pageMatches.length === 0) return;
+
+  const viewport = pageView.viewport;
+
+  pageMatches.forEach(match => {
+    // Loop through all rectangles making up this match
+    match.rects.forEach(rect => {
+      const pt = viewport.convertToViewportPoint(rect.x, rect.y);
+      const scaledWidth = rect.width * viewport.scale;
+      const scaledHeight = rect.height * viewport.scale;
+
+      const div = document.createElement('div');
+      div.className = 'custom-highlight' + (match.index === activeMatchIndex ? ' active' : '');
+      
+      div.style.left = pt[0] + 'px';
+      div.style.top = (pt[1] - scaledHeight) + 'px'; 
+      div.style.width = scaledWidth + 'px';
+      div.style.height = (scaledHeight * 1.2) + 'px'; 
+      
+      pageView.div.appendChild(div);
+      
+      if (match.index === activeMatchIndex) {
+         div.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  });
+}
+
+render();
+</script>
+</body>
+</html>`;
+}
+
+export default function App() {
+  // usePreventScreenCapture();
+  const [viewerUri, setViewerUri] = useState("");
+  const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [count, setCount] = useState("0/0");
   const [showSearch, setShowSearch] = useState(false);
-
   const webRef = useRef<WebView>(null);
-  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  function forceMobileDocumentVisible() {
-    webRef.current?.injectJavaScript(`
-      (function () {
-        function reveal(attempt) {
-          var container = document.getElementById("page-container");
-          var pages = document.getElementsByClassName("pf");
-          if (!container || !pages.length) {
-            if (attempt < 10) {
-              window.setTimeout(function () {
-                reveal(attempt + 1);
-              }, 500);
-              return;
-            }
-
-            window.ReactNativeWebView.postMessage(JSON.stringify({
-              type: "document-error",
-              message: "No PDF container or pages found",
-              container: !!container,
-              pages: pages.length,
-              bodyLength: document.body ? document.body.innerHTML.length : 0,
-              url: window.location.href
-            }));
-            return;
-          }
-
-          var containerWidth = container.clientWidth || window.innerWidth;
-          var viewer = window.pdf2htmlEX && window.pdf2htmlEX.defaultViewer;
-          var firstPage = viewer && viewer.pages && viewer.pages[0];
-          if (viewer && firstPage) {
-            var originalWidth = firstPage.original_width || firstPage.width();
-            viewer.rescale(containerWidth / originalWidth);
-          }
-
-          window.ReactNativeWebView.postMessage(JSON.stringify({
-            type: "document-ready",
-            pages: pages.length,
-            containerWidth: containerWidth,
-            firstPageWidth: pages[0].offsetWidth,
-            firstPageHeight: pages[0].offsetHeight
-          }));
-        }
-
-        reveal(0);
-      })();
-      true;
-    `);
-  }
-
-  function prepareDocument(documentHtml: string) {
-    const mobileViewport =
-      '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes">';
-
-    const mobileStyles = `
-      <style>
-        @media screen {
-          html, body, #page-container {
-            max-width: 100%;
-            overflow-x: hidden !important;
-          }
-
-          #page-container {
-            left: 0 !important;
-            right: 0 !important;
-          }
-
-          /* Prevent selecting/copying document text */
-          html, body, #page-container, .pf, .pc, .t {
-            -webkit-user-select: none !important;
-            user-select: none !important;
-            -webkit-touch-callout: none !important;
-          }
-
-          .pf {
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-          }
-
-          .pc {
-            display: block !important;
-          }
-
-          mark.search-match {
-            background-color: #ffeb3b !important;
-            color: #111 !important;
-          }
-
-          mark.search-match.current-match {
-            background-color: #ff9800 !important;
-            color: #111 !important;
-          }
-
-          /* Make TOC entries look clickable */
-          .toc-entry {
-            cursor: pointer !important;
-            text-decoration: underline !important;
-            text-decoration-thickness: 1px !important;
-            text-underline-offset: 2px !important;
-          }
-
-          /*
-          * Custom document scrollbar
-          */
-          .custom-scrollbar {
-            position: fixed;
-            top: 8px;
-            right: 2px;
-            bottom: 8px;
-            width: 22px;              /* much easier to grab */
-            z-index: 999999;
-            pointer-events: auto;
-          }
-
-          .custom-scrollbar-thumb {
-            position: absolute;
-            top: 0;
-            left: 4px;
-            width: 14px;              /* wider visible thumb */
-            min-height: 60px;
-            border-radius: 10px;
-            background: rgba(0, 0, 0, 0.45);
-            touch-action: none;
-            user-select: none;
-            -webkit-user-select: none;
-          }
-
-          .custom-scrollbar-thumb:active {
-            background: rgba(0, 0, 0, 0.7);
-          }
-
-          /*
-          * Hide the browser's native scrollbar for the element
-          * that we are controlling with our custom scrollbar.
-          */
-          .custom-scroll-host {
-            scrollbar-width: none !important;
-            -ms-overflow-style: none !important;
-          }
-
-          .custom-scroll-host::-webkit-scrollbar {
-            width: 0 !important;
-            height: 0 !important;
-          }
-        }
-      </style>`;
-
-    const mobileFitScript = `
-      <script>
-        (function () {
-
-          function fitDocumentToWidth() {
-            if (!window.pdf2htmlEX || !window.pdf2htmlEX.defaultViewer) {
-              window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({
-                type: "viewer-error",
-                message: "pdf2htmlEX viewer was not initialized"
-              }));
-              return;
-            }
-
-            var viewer = window.pdf2htmlEX.defaultViewer;
-            var page = viewer.pages && viewer.pages[0];
-
-            if (page && (page.original_width || page.width())) {
-              var originalWidth = page.original_width || page.width();
-
-              viewer.rescale(
-                viewer.container.clientWidth / originalWidth
-              );
-
-              viewer.scroll_to(viewer.cur_page_idx);
-
-              window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({
-                type: "viewer-ready",
-                pages: viewer.pages.length,
-                width: viewer.container.clientWidth,
-                pageWidth: originalWidth
-              }));
-            }
-          }
-
-          window.addEventListener("load", function () {
-            setTimeout(fitDocumentToWidth, 500);
-          });
-
-        })();
-      </script>`;
-
-    const copyProtectionScript = `
-      <script>
-        (function () {
-
-          document.addEventListener("contextmenu", function (event) {
-            event.preventDefault();
-          });
-
-          document.addEventListener("selectstart", function (event) {
-            event.preventDefault();
-          });
-
-          document.addEventListener("copy", function (event) {
-            event.preventDefault();
-          });
-
-          document.addEventListener("cut", function (event) {
-            event.preventDefault();
-          });
-
-        })();
-      </script>`;
-
-    const tocScript = `
-      <script>
-        (function () {
-
-          function setupTOC() {
-
-            /*
-            * Find the page containing "Table of contents".
-            * This avoids hardcoding pf2.
-            */
-            var pages = document.querySelectorAll(".pf");
-            var tocPage = null;
-
-            for (var i = 0; i < pages.length; i++) {
-              var pageText = (pages[i].textContent || "").toLowerCase();
-
-              if (pageText.indexOf("table of contents") !== -1) {
-                tocPage = pages[i];
-                break;
-              }
-            }
-
-            if (!tocPage) {
-              setTimeout(setupTOC, 500);
-              return;
-            }
-
-            var textBoxes = tocPage.querySelectorAll(".t");
-
-            textBoxes.forEach(function (box) {
-
-              var text = (box.textContent || "").trim();
-
-              /*
-              * TOC rows look like:
-              *
-              * Articles                         14
-              * Tense                             29
-              * Vocabulary                        48
-              *
-              * Get the number at the END of the row.
-              */
-              var match = text.match(/(\\d+)$/);
-
-              if (!match) {
-                return;
-              }
-
-              var pageNumber = parseInt(match[1], 10);
-
-              if (!pageNumber || pageNumber < 1) {
-                return;
-              }
-
-              /*
-              * Prevent duplicate click listeners if setupTOC
-              * happens more than once.
-              */
-              if (box.classList.contains("toc-entry")) {
-                return;
-              }
-
-              box.classList.add("toc-entry");
-
-              box.addEventListener("click", function () {
-
-                if (
-                  window.pdf2htmlEX &&
-                  window.pdf2htmlEX.defaultViewer
-                ) {
-
-                  var viewer = window.pdf2htmlEX.defaultViewer;
-
-                  /*
-                  * IMPORTANT:
-                  *
-                  * Do NOT use pf + pageNumber here.
-                  *
-                  * pdf2htmlEX can have IDs like:
-                  * pf59, pf5a, pf5b...
-                  *
-                  * viewer.pages is the actual ordered page list.
-                  */
-                  var targetIndex = pageNumber - 1;
-
-                  if (
-                    targetIndex >= 0 &&
-                    targetIndex < viewer.pages.length
-                  ) {
-                    viewer.scroll_to(targetIndex);
-                  } else {
-                    console.log(
-                      "TOC page number is outside document:",
-                      pageNumber,
-                      "Total pages:",
-                      viewer.pages.length
-                    );
-                  }
-
-                } else {
-                  console.log("pdf2htmlEX viewer not available");
-                }
-
-              });
-
-            });
-
-          }
-
-          window.addEventListener("load", function () {
-            setTimeout(setupTOC, 1000);
-          });
-
-        })();
-      </script>`;
-
-    const scrollbarScript = `
-      <script>
-        (function () {
-
-          var scrollElement = null;
-          var scrollbar = null;
-          var thumb = null;
-          var dragging = false;
-          var dragStartY = 0;
-          var dragStartTop = 0;
-          var animationFrame = null;
-
-          function findScrollElement() {
-
-            /*
-            * Prefer pdf2htmlEX's viewer container because that is
-            * normally responsible for the document scrolling.
-            */
-            if (
-              window.pdf2htmlEX &&
-              window.pdf2htmlEX.defaultViewer &&
-              window.pdf2htmlEX.defaultViewer.container
-            ) {
-              var viewerContainer =
-                window.pdf2htmlEX.defaultViewer.container;
-
-              if (
-                viewerContainer.scrollHeight >
-                viewerContainer.clientHeight + 1
-              ) {
-                return viewerContainer;
-              }
-            }
-
-            /*
-            * Fallback to the normal document scrolling element.
-            */
-            var documentScroller = document.scrollingElement;
-
-            if (
-              documentScroller &&
-              documentScroller.scrollHeight >
-              documentScroller.clientHeight + 1
-            ) {
-              return documentScroller;
-            }
-
-            return null;
-          }
-
-          function createScrollbar() {
-
-            if (scrollbar) {
-              return true;
-            }
-
-            scrollElement = findScrollElement();
-
-            if (!scrollElement) {
-              return false;
-            }
-
-            /*
-            * Hide native scrollbar.
-            */
-            scrollElement.classList.add("custom-scroll-host");
-
-            scrollbar = document.createElement("div");
-            scrollbar.className = "custom-scrollbar";
-
-            thumb = document.createElement("div");
-            thumb.className = "custom-scrollbar-thumb";
-
-            scrollbar.appendChild(thumb);
-            document.body.appendChild(scrollbar);
-
-            /*
-            * Dragging the thumb.
-            */
-            thumb.addEventListener(
-              "pointerdown",
-              function (event) {
-
-                event.preventDefault();
-                event.stopPropagation();
-
-                dragging = true;
-
-                dragStartY = event.clientY;
-
-                dragStartTop =
-                  parseFloat(thumb.style.top) || 0;
-
-                if (thumb.setPointerCapture) {
-                  try {
-                    thumb.setPointerCapture(event.pointerId);
-                  } catch (e) {}
-                }
-              }
-            );
-
-            /*
-            * Move thumb while dragging.
-            */
-            thumb.addEventListener(
-              "pointermove",
-              function (event) {
-
-                if (!dragging) {
-                  return;
-                }
-
-                event.preventDefault();
-
-                var trackHeight =
-                  scrollbar.clientHeight;
-
-                var thumbHeight =
-                  thumb.offsetHeight;
-
-                var maxThumbTop =
-                  Math.max(0, trackHeight - thumbHeight);
-
-                if (maxThumbTop <= 0) {
-                  return;
-                }
-
-                var newTop =
-                  dragStartTop +
-                  (event.clientY - dragStartY);
-
-                newTop = Math.max(
-                  0,
-                  Math.min(maxThumbTop, newTop)
-                );
-
-                var ratio =
-                  newTop / maxThumbTop;
-
-                var maxScroll =
-                  scrollElement.scrollHeight -
-                  scrollElement.clientHeight;
-
-                scrollElement.scrollTop =
-                  ratio * maxScroll;
-
-                updateThumb();
-              }
-            );
-
-            /*
-            * Stop dragging.
-            */
-            function stopDragging(event) {
-
-              if (!dragging) {
-                return;
-              }
-
-              dragging = false;
-
-              if (
-                event &&
-                thumb.releasePointerCapture
-              ) {
-                try {
-                  thumb.releasePointerCapture(
-                    event.pointerId
-                  );
-                } catch (e) {}
-              }
-            }
-
-            thumb.addEventListener(
-              "pointerup",
-              stopDragging
-            );
-
-            thumb.addEventListener(
-              "pointercancel",
-              stopDragging
-            );
-
-            /*
-            * Tapping the scrollbar track jumps toward
-            * that location.
-            */
-            scrollbar.addEventListener(
-              "pointerdown",
-              function (event) {
-
-                if (event.target === thumb) {
-                  return;
-                }
-
-                var rect =
-                  scrollbar.getBoundingClientRect();
-
-                var clickY =
-                  event.clientY - rect.top;
-
-                var trackHeight =
-                  scrollbar.clientHeight;
-
-                var thumbHeight =
-                  thumb.offsetHeight;
-
-                var maxThumbTop =
-                  Math.max(0, trackHeight - thumbHeight);
-
-                var targetTop =
-                  clickY - (thumbHeight / 2);
-
-                targetTop = Math.max(
-                  0,
-                  Math.min(maxThumbTop, targetTop)
-                );
-
-                var ratio =
-                  maxThumbTop > 0
-                    ? targetTop / maxThumbTop
-                    : 0;
-
-                var maxScroll =
-                  scrollElement.scrollHeight -
-                  scrollElement.clientHeight;
-
-                scrollElement.scrollTop =
-                  ratio * maxScroll;
-
-                updateThumb();
-              }
-            );
-
-            /*
-            * Update scrollbar whenever the document scrolls.
-            */
-            scrollElement.addEventListener(
-              "scroll",
-              scheduleUpdate,
-              { passive: true }
-            );
-
-            window.addEventListener(
-              "resize",
-              scheduleUpdate
-            );
-
-            updateThumb();
-
-            return true;
-          }
-
-          function updateThumb() {
-
-            if (
-              !scrollElement ||
-              !scrollbar ||
-              !thumb
-            ) {
-              return;
-            }
-
-            var scrollHeight =
-              scrollElement.scrollHeight;
-
-            var clientHeight =
-              scrollElement.clientHeight;
-
-            var maxScroll =
-              scrollHeight - clientHeight;
-
-            if (maxScroll <= 0) {
-              scrollbar.style.display = "none";
-              return;
-            }
-
-            scrollbar.style.display = "block";
-
-            var trackHeight =
-              scrollbar.clientHeight;
-
-            /*
-            * Thumb size represents how much of the
-            * document is currently visible.
-            */
-            var thumbHeight =
-              Math.max(
-                50,
-                trackHeight *
-                (clientHeight / scrollHeight)
-              );
-
-            thumbHeight =
-              Math.min(trackHeight, thumbHeight);
-
-            thumb.style.height =
-              thumbHeight + "px";
-
-            var maxThumbTop =
-              Math.max(
-                0,
-                trackHeight - thumbHeight
-              );
-
-            var ratio =
-              maxScroll > 0
-                ? scrollElement.scrollTop / maxScroll
-                : 0;
-
-            thumb.style.top =
-              (ratio * maxThumbTop) + "px";
-          }
-
-          function scheduleUpdate() {
-
-            if (animationFrame) {
-              return;
-            }
-
-            animationFrame =
-              requestAnimationFrame(function () {
-
-                animationFrame = null;
-
-                updateThumb();
-              });
-          }
-
-          function initialize() {
-
-            if (createScrollbar()) {
-              return;
-            }
-
-            /*
-            * pdf2htmlEX may not have finished creating
-            * all of its pages yet.
-            */
-            setTimeout(initialize, 500);
-          }
-
-          window.addEventListener(
-            "load",
-            function () {
-              setTimeout(initialize, 1000);
-            }
-          );
-
-        })();
-      </script>`;
-
-    const searchScript = `
-      <script>
-        (function () {
-
-          var matches = [];
-          var currentMatch = -1;
-          var textBoxes = null;
-          var textValues = null;
-
-          function reportSearch() {
-            window.ReactNativeWebView.postMessage(JSON.stringify({
-              type: "search",
-              current: matches.length ? currentMatch + 1 : 0,
-              total: matches.length
-            }));
-          }
-
-          function clearMatches() {
-
-            document
-              .querySelectorAll(".search-match")
-              .forEach(function (mark) {
-
-                var parent = mark.parentNode;
-
-                if (parent) {
-
-                  parent.replaceChild(
-                    document.createTextNode(
-                      mark.textContent || ""
-                    ),
-                    mark
-                  );
-
-                  parent.normalize();
-                }
-
-              });
-
-            matches = [];
-            currentMatch = -1;
-          }
-
-          function buildTextIndex() {
-
-            if (textBoxes) {
-              return;
-            }
-
-            textBoxes =
-              Array.prototype.slice.call(
-                document.getElementsByClassName("t")
-              );
-
-            textValues =
-              textBoxes.map(function (textBox) {
-
-                return (
-                  textBox.textContent || ""
-                ).toLocaleLowerCase();
-
-              });
-          }
-
-          window.search = function (term) {
-
-            clearMatches();
-
-            term =
-              String(term || "").trim();
-
-            if (!term) {
-              reportSearch();
-              return;
-            }
-
-            buildTextIndex();
-
-            var normalizedTerm =
-              term.toLocaleLowerCase();
-
-            textBoxes.forEach(
-              function (textBox, boxIndex) {
-
-                if (
-                  textValues[boxIndex]
-                    .indexOf(normalizedTerm) === -1
-                ) {
-                  return;
-                }
-
-                var walker =
-                  document.createTreeWalker(
-                    textBox,
-                    NodeFilter.SHOW_TEXT
-                  );
-
-                var textNodes = [];
-                var node;
-
-                while (
-                  (node = walker.nextNode())
-                ) {
-                  textNodes.push(node);
-                }
-
-                textNodes.forEach(
-                  function (textNode) {
-
-                    var value =
-                      textNode.nodeValue || "";
-
-                    var fragment =
-                      document.createDocumentFragment();
-
-                    var lastIndex = 0;
-                    var found = false;
-
-                    var lowerValue =
-                      value.toLocaleLowerCase();
-
-                    var lowerTerm =
-                      normalizedTerm;
-
-                    var offset =
-                      lowerValue.indexOf(
-                        lowerTerm,
-                        lastIndex
-                      );
-
-                    while (offset !== -1) {
-
-                      found = true;
-
-                      var match =
-                        value.slice(
-                          offset,
-                          offset + term.length
-                        );
-
-                      fragment.appendChild(
-                        document.createTextNode(
-                          value.slice(
-                            lastIndex,
-                            offset
-                          )
-                        )
-                      );
-
-                      var mark =
-                        document.createElement("mark");
-
-                      mark.className =
-                        "search-match";
-
-                      mark.textContent =
-                        match;
-
-                      fragment.appendChild(mark);
-
-                      matches.push(mark);
-
-                      lastIndex =
-                        offset + match.length;
-
-                      offset =
-                        lowerValue.indexOf(
-                          lowerTerm,
-                          lastIndex
-                        );
-                    }
-
-                    if (found) {
-
-                      fragment.appendChild(
-                        document.createTextNode(
-                          value.slice(lastIndex)
-                        )
-                      );
-
-                      textNode.parentNode.replaceChild(
-                        fragment,
-                        textNode
-                      );
-                    }
-
-                  }
-                );
-
-              }
-            );
-
-            if (matches.length) {
-
-              currentMatch = 0;
-
-              matches[0].classList.add("current-match");
-
-              matches[0].scrollIntoView({
-                block: "center"
-              });
-            }
-
-            reportSearch();
-          };
-
-          window.nextMatch = function () {
-
-            if (!matches.length) {
-              return;
-            }
-
-            currentMatch =
-              (currentMatch + 1) %
-              matches.length;
-
-            matches.forEach(function (match) {
-              match.classList.remove("current-match");
-            });
-            matches[currentMatch].classList.add("current-match");
-
-            matches[currentMatch].scrollIntoView({
-              block: "center"
-            });
-
-            reportSearch();
-          };
-
-          window.prevMatch = function () {
-
-            if (!matches.length) {
-              return;
-            }
-
-            currentMatch =
-              (currentMatch - 1 + matches.length) %
-              matches.length;
-
-            matches.forEach(function (match) {
-              match.classList.remove("current-match");
-            });
-            matches[currentMatch].classList.add("current-match");
-
-            matches[currentMatch].scrollIntoView({
-              block: "center"
-            });
-
-            reportSearch();
-          };
-
-        })();
-      </script>`;
-
-    return documentHtml
-      .replace(
-        /<head>/i,
-        `<head>${mobileViewport}${mobileStyles}`
-      )
-      .replace(
-        /<\/body>/i,
-        `${mobileFitScript}${tocScript}${scrollbarScript}${copyProtectionScript}${searchScript}</body>`
-      );
-  }
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    async function load() {
+    (async () => {
       try {
-        console.log("[GrammarApp] Downloading document HTML...");
-
-        const response = await fetch(
-          "https://drive.google.com/uc?export=download&id=1xjlLFrDG9GxesgK8ButdfHtkZtOPH9Po"
-        );
-
-        if (!response.ok) {
-          throw new Error(`Download failed with HTTP ${response.status}`);
-        }
-
-        const downloadedHtml = await response.text();
-        console.log("[GrammarApp] Response:", {
-          status: response.status,
-          contentType: response.headers.get("content-type"),
-          length: downloadedHtml.length,
-          startsWith: downloadedHtml.slice(0, 80),
-        });
-
-        if (!downloadedHtml.toLowerCase().includes("<html")) {
-          throw new Error("Google Drive returned something other than HTML");
-        }
-
-        const text = prepareDocument(downloadedHtml);
-        const documentUri = `${FileSystem.cacheDirectory}grammar-document.html`;
-
-        console.log("[GrammarApp] Writing prepared document to cache...");
-        await FileSystem.writeAsStringAsync(documentUri, text, {
-          encoding: FileSystem.EncodingType.UTF8,
-        });
-
-        console.log("[GrammarApp] Prepared document:", text.length);
-
-        console.log("[GrammarApp] Cached document:", documentUri);
-        setDocumentUri(documentUri);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        console.error("[GrammarApp] Document load failed:", message, e);
-        setLoadError(message);
+        console.log("[GrammarApp] Downloading PDF...");
+        const pdfUri = `${FileSystem.cacheDirectory}grammar-document.pdf`;
+        await FileSystem.downloadAsync(PDF_URL, pdfUri);
+        const viewerUri = `${FileSystem.cacheDirectory}pdf-viewer.html`;
+        await FileSystem.writeAsStringAsync(viewerUri, createViewerHtml(pdfUri), { encoding: FileSystem.EncodingType.UTF8 });
+        console.log("[GrammarApp] PDF cached:", pdfUri);
+        setViewerUri(viewerUri);
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        console.error("[GrammarApp] PDF load failed:", message);
+        setError(message);
       }
-    }
-
-    load();
+    })();
   }, []);
 
-  function search(text: string) {
-    if (searchTimer.current) {
-      clearTimeout(searchTimer.current);
-    }
-
-    searchTimer.current = setTimeout(() => {
-      webRef.current?.injectJavaScript(
-        `search(${JSON.stringify(text)});true;`
-      );
+  function search(value: string) {
+    setQuery(value);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      webRef.current?.injectJavaScript(`window.search(${JSON.stringify(value)});true;`);
     }, 250);
   }
 
-  function next() {
-    webRef.current?.injectJavaScript(`nextMatch();true;`);
+  function move(name: "nextMatch" | "prevMatch") {
+    webRef.current?.injectJavaScript(`window.${name}();true;`);
   }
 
-  function previous() {
-    webRef.current?.injectJavaScript(`prevMatch();true;`);
-  }
+  if (error) return (
+    <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 24 }}>
+      <Text style={{ color: "#b00020", fontSize: 18 }}>Unable to load PDF</Text>
+      <Text>{error}</Text>
+    </View>
+  );
 
-  if (loadError) {
-    return (
-      <View
-        style={{
-          flex: 1,
-          justifyContent: "center",
-          alignItems: "center",
-          padding: 24,
-        }}
-      >
-        <Text style={{ fontSize: 18, textAlign: "center", color: "#B00020" }}>
-          Unable to load the document.
-        </Text>
-        <Text style={{ marginTop: 10, textAlign: "center" }}>{loadError}</Text>
-      </View>
-    );
-  }
-
-  if (!documentUri) {
-    return (
-      <View
-        style={{
-          flex: 1,
-          justifyContent: "center",
-          alignItems: "center",
-        }}
-      >
-        <ActivityIndicator size="large" />
-      </View>
-    );
-  }
+  if (!viewerUri) return (
+    <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+      <ActivityIndicator size="large" />
+      <Text style={{ marginTop: 12 }}>Downloading document...</Text>
+    </View>
+  );
 
   return (
     <SafeAreaView style={{ flex: 1 }}>
-
-      <View
-        style={{
-          backgroundColor: "#1565C0",
-          paddingHorizontal: 16,
-          paddingVertical: 14,
-          flexDirection: "row",
-          alignItems: "center",
-          justifyContent: "space-between",
-          elevation:5,
-          shadowColor:"#000",
-          shadowOpacity:0.15,
-          shadowRadius:6,
-        }}
-      >
-
-        <Text
-          style={{
-            color: "white",
-            fontSize: 22,
-            fontWeight: "bold",
-          }}
-        >
-          Contact: 8247829025
-        </Text>
-
-        <View
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-          }}
-        >
-
-          <TouchableOpacity
-            onPress={() => {
-
-                if(showSearch){
-
-                    setQuery("");
-
-                    search("");
-
-                }
-
-                setShowSearch(!showSearch);
-
-            }}
-          >
-            <MaterialIcons
-              name={showSearch ? "close" : "search"}
-              color="white"
-              size={28}
-            />
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={{ marginLeft: 15 }}
-          >
-            <MaterialIcons
-              name="more-vert"
-              color="white"
-              size={28}
-            />
-          </TouchableOpacity>
-
-        </View>
-
+      <View style={{ backgroundColor: "#1565C0", padding: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+        <Text style={{ color: "white", fontSize: 20, fontWeight: "bold" }}>Contact: 8247829025</Text>
+        <TouchableOpacity onPress={() => setShowSearch(!showSearch)}>
+          <MaterialIcons name={showSearch ? "close" : "search"} color="white" size={28} />
+        </TouchableOpacity>
       </View>
-
-      {
-        showSearch && (
-
-        <View
-        style={{
-        backgroundColor:"#1565C0",
-        paddingHorizontal:16,
-        paddingBottom:15
-        }}
-        >
-
-        <View
-        style={{
-        backgroundColor:"white",
-        borderRadius:12,
-        flexDirection:"row",
-        alignItems:"center",
-        paddingHorizontal:10,
-        height:48
-        }}
-        >
-
-        <MaterialIcons
-        name="search"
-        size={24}
-        color="#666"
-        />
-
-        <TextInput
-
-        style={{
-        flex:1,
-        marginLeft:10,
-        fontSize:17
-        }}
-
-        placeholder="Search..."
-
-        value={query}
-
-        onChangeText={(t)=>{
-
-        setQuery(t);
-
-        search(t);
-
-        }}
-
-        />
-
-        <Text
-        style={{
-        marginHorizontal:10,
-        color:"#666",
-        fontWeight:"600"
-        }}
-        >
-
-        {count}
-
-        </Text>
-
-        <TouchableOpacity
-        onPress={previous}
-        >
-
-        <MaterialIcons
-        name="keyboard-arrow-up"
-        size={28}
-        />
-
-        </TouchableOpacity>
-
-        <TouchableOpacity
-        onPress={next}
-        >
-
-        <MaterialIcons
-        name="keyboard-arrow-down"
-        size={28}
-        />
-
-        </TouchableOpacity>
-
+      
+      {showSearch && (
+        <View style={{ backgroundColor: "#1565C0", padding: 12 }}>
+          <View style={{ backgroundColor: "white", height: 48, flexDirection: "row", alignItems: "center", paddingHorizontal: 10 }}>
+            <TextInput autoFocus style={{ flex: 1, fontSize: 17 }} placeholder="Search..." value={query} onChangeText={search} />
+            <Text style={{ marginHorizontal: 10 }}>{count}</Text>
+            <TouchableOpacity onPress={() => move("prevMatch")}>
+              <MaterialIcons name="keyboard-arrow-up" size={28} />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => move("nextMatch")}>
+              <MaterialIcons name="keyboard-arrow-down" size={28} />
+            </TouchableOpacity>
+          </View>
         </View>
-
-        </View>
-
-        )
-        }
-
-      <WebView
-        ref={webRef}
-        originWhitelist={["*"]}
-        source={{ uri: documentUri }}
-        style={{ flex: 1 }}
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        allowFileAccess={true}
-        allowFileAccessFromFileURLs={true}
-        allowUniversalAccessFromFileURLs={true}
-        onMessage={(event) => {
-          console.log("[GrammarApp] WebView message:", event.nativeEvent.data);
-          try {
-            const data = JSON.parse(event.nativeEvent.data);
-            if (data.type === "search") {
-              setCount(`${data.current}/${data.total}`);
-            }
-          } catch (e) {
-            console.log(e);
-          }
-        }}
-        onLoadStart={() => console.log("[GrammarApp] WebView load started")}
-        onLoad={() => console.log("[GrammarApp] WebView load completed")}
-        onLoadEnd={() => console.log("[GrammarApp] WebView load ended")}
-        onNavigationStateChange={(state) => {
-          console.log("[GrammarApp] WebView navigation:", {
-            loading: state.loading,
-            url: state.url,
-          });
-          if (!state.loading) {
-            setTimeout(forceMobileDocumentVisible, 3000);
-          }
-        }}
-        onError={(event) => {
-          console.error("[GrammarApp] WebView error:", event.nativeEvent);
-        }}
-        onHttpError={(event) => {
-          console.error("[GrammarApp] WebView HTTP error:", event.nativeEvent);
-        }}
-        onRenderProcessGone={(event) => {
-          console.error(
-            "[GrammarApp] WebView renderer stopped:",
-            event.nativeEvent
-          );
-        }}
+      )}
+      
+      <WebView 
+        ref={webRef} 
+        source={{ uri: viewerUri }} 
+        originWhitelist={["*"]} 
+        javaScriptEnabled 
+        domStorageEnabled 
+        allowFileAccess 
+        allowFileAccessFromFileURLs 
+        allowUniversalAccessFromFileURLs 
+        style={{ flex: 1 }} 
+        onMessage={(event) => { 
+          try { 
+            const data = JSON.parse(event.nativeEvent.data); 
+            console.log("[GrammarApp] PDF message:", data); 
+            if (data.type === "search") setCount(`${data.current}/${data.total}`); 
+            if (data.type === "pdf-error") setError(data.message); 
+          } catch (cause) { 
+            console.error("[GrammarApp] PDF message error:", cause); 
+          } 
+        }} 
+        onError={(event) => console.error("[GrammarApp] WebView error:", event.nativeEvent)} 
       />
-
     </SafeAreaView>
   );
 }
