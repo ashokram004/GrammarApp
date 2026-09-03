@@ -40,5 +40,4 @@ yarn-error.*
 /ios
 /android
 
-google-services.json
 database.rules.json

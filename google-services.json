@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "959816204912",
+    "project_id": "doclocker-ab9b8",
+    "storage_bucket": "doclocker-ab9b8.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:959816204912:android:2927408f50b1f7d595aab5",
+        "android_client_info": {
+          "package_name": "com.ashokram004.GrammarApp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB8isjDB6SFJPpIysXFAk8k8jbhX1MO5qo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
