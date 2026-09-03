@@ -19,6 +19,17 @@ function normalizePhoneNumber(value: string) {
   return value.replace(/\D/g, "").replace(/^0+/, "");
 }
 
+function getLoginErrorMessage(cause: unknown) {
+  const code = typeof cause === "object" && cause !== null && "code" in cause ? String(cause.code) : "";
+
+  if (code.includes("permission-denied")) return "We could not verify this number right now. Please try again.";
+  if (code.includes("network-request-failed") || code.includes("network-error")) return "No internet connection. Connect to the internet and try again.";
+  if (code.includes("operation-not-allowed")) return "Login is temporarily unavailable. Please contact support.";
+  if (code.includes("app-not-authorized") || code.includes("invalid-api-key")) return "This app is not connected to Firebase correctly. Please install the latest version.";
+  if (code.includes("database")) return "We could not contact the access service. Check your internet connection and try again.";
+  return "We could not verify your access. Please try again in a moment.";
+}
+
 async function refreshCachedPdf(pdfUri: string) {
   const localInfo = await FileSystem.getInfoAsync(pdfUri, { md5: true });
   const network = await NetInfo.fetch();
@@ -591,7 +602,7 @@ export default function App() {
     } else {
       signInAnonymously(firebaseAuth)
         .then(({ user }) => setFirebaseUser(user))
-        .catch((cause: unknown) => setLoginError(cause instanceof Error ? cause.message : String(cause)));
+        .catch((cause: unknown) => setLoginError(getLoginErrorMessage(cause)));
     }
 
     AsyncStorage.getItem(ACTIVATION_KEY).then((storedPhone) => {
@@ -668,7 +679,7 @@ export default function App() {
 
       setLoginError("This number is already active on another phone.");
     } catch (cause) {
-      setLoginError(cause instanceof Error ? `Could not verify access: ${cause.message}` : "Could not verify access. Check Firebase settings and your internet connection.");
+      setLoginError(getLoginErrorMessage(cause));
     } finally {
       setIsLoggingIn(false);
     }
