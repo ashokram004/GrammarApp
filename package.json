@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@react-native-community/netinfo": "^11.0.0",
+    "@react-native-community/slider": "5.0.1",
     "expo": "~54.0.37",
     "expo-asset": "~12.0.13",
     "expo-file-system": "~19.0.24",
