@@ -5,8 +5,9 @@ import WebView from "react-native-webview";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { usePreventScreenCapture } from "expo-screen-capture";
 import * as FileSystem from "expo-file-system/legacy";
+import NetInfo from "@react-native-community/netinfo";
 
-const PDF_URL = "https://drive.google.com/uc?export=download&id=1ttnTzgZEobC2_zmWLvhL7AKiNbgRh-P5";
+const PDF_URL = "https://drive.google.com/uc?export=download&confirm=t&id=1ttnTzgZEobC2_zmWLvhL7AKiNbgRh-P5";
 
 function createViewerHtml(pdfUri: string) {
   return `<!doctype html>
@@ -66,64 +67,69 @@ let currentMatches = [];
 let activeMatchIndex = -1;
 let pdfDoc = null;
 
-// Hidden canvas to measure proportional character widths accurately
-const measureCanvas = document.createElement('canvas');
-const measureCtx = measureCanvas.getContext('2d');
-measureCtx.font = '16px sans-serif'; 
-
 function send(type, data) {
   if (window.ReactNativeWebView) {
     window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...(data || {}) }));
   }
 }
 
+// 1. Build Index using pure Content Stream Order + Linear Width Distribution
 async function buildSearchIndex(pdf) {
   customSearchIndex = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
-    const textContent = await page.getTextContent();
+    // Allow natural combination, do not force granular chunks
+    const textContent = await page.getTextContent(); 
     
     let pageString = "";
     let mapping = [];
 
-    // 1. Sort text chunks visually (Top to Bottom, then Left to Right)
-    const sortedItems = textContent.items.slice().sort((a, b) => {
-      const yDiff = b.transform[5] - a.transform[5];
-      // If Y difference is greater than 5 points, they are on different lines
-      if (Math.abs(yDiff) > 5) return b.transform[5] - a.transform[5];
-      // Otherwise, sort by X coordinate (Left to Right)
-      return a.transform[4] - b.transform[4];
-    });
-
-    sortedItems.forEach(item => {
-      const text = item.str;
-      const height = item.height || Math.abs(item.transform[3]);
+    textContent.items.forEach(item => {
+      const text = item.str || "";
+      const cleanedText = text.replace(/[\\s\\u200B-\\u200D]/g, "");
       
-      // Calculate relative width ratios using canvas
-      const totalEstWidth = measureCtx.measureText(text).width;
-      const widthScale = totalEstWidth === 0 ? 0 : item.width / totalEstWidth;
-
-      let currentX = item.transform[4];
-      const currentY = item.transform[5];
-
-      for (let c = 0; c < text.length; c++) {
-        const char = text[c];
-        const charWidth = measureCtx.measureText(char).width * widthScale;
-
-        if (char.trim().length > 0 && char !== '\\u200B' && char !== '\\u200D') {
-          pageString += char;
-          mapping.push({
-            x: currentX,
-            y: currentY,
-            width: charWidth,
-            height: height
-          });
+      if (cleanedText.length > 0) {
+        // Linearly distribute the bounding box width across the actual characters
+        const avgWidth = (item.width || 0) / Math.max(1, text.length);
+        let currentX = item.transform[4];
+        const currentY = item.transform[5];
+        const height = Math.abs(item.transform[3] || item.height || 12);
+        
+        for (let c = 0; c < text.length; c++) {
+          const char = text[c];
+          // Only map visible characters to our searchable string
+          if (char.trim().length > 0 && char !== '\\u200B' && char !== '\\u200D') {
+            pageString += char;
+            mapping.push({ x: currentX, y: currentY, width: avgWidth, height: height });
+          }
+          // Advance X for every character (even spaces) to maintain geometric integrity
+          currentX += avgWidth; 
         }
-        currentX += charWidth;
       }
     });
+    
     customSearchIndex.push({ pageNum: i, searchableText: pageString, mapping });
   }
+}
+
+// 2. Strict Mathematical Envelope Merge
+function mergeBoxes(boxes) {
+    if (boxes.length === 0) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxHeight = 0;
+
+    boxes.forEach(b => {
+        if (b.x < minX) minX = b.x;
+        if (b.x + b.width > maxX) maxX = b.x + b.width;
+        if (b.y < minY) minY = b.y; 
+        if (b.height > maxHeight) maxHeight = b.height;
+    });
+
+    return { 
+        x: minX, 
+        y: minY, 
+        width: Math.max(0, maxX - minX), 
+        height: maxHeight 
+    };
 }
 
 eventBus.on("pagerendered", (e) => {
@@ -131,6 +137,10 @@ eventBus.on("pagerendered", (e) => {
 });
 
 eventBus.on("pagesinit", () => {
+  pdfViewer.currentScaleValue = "page-width";
+});
+
+window.addEventListener("resize", () => {
   pdfViewer.currentScaleValue = "page-width";
 });
 
@@ -161,42 +171,48 @@ window.search = (query) => {
      return;
   }
 
-  const normalizedQuery = String(query).replace(/[\\s\\u200B-\\u200D]/g, "");
+  // FIX: Convert the normalized query to lowercase
+  const normalizedQuery = String(query).replace(/[\\s\\u200B-\\u200D]/g, "").toLowerCase();
   if (!normalizedQuery) return;
 
   customSearchIndex.forEach((pageData) => {
     let startIndex = 0;
     let matchIdx;
     
-    while ((matchIdx = pageData.searchableText.indexOf(normalizedQuery, startIndex)) > -1) {
-      let matchRects = [];
-      let currentRect = null;
-
-      // Group highlights by line to prevent giant screen-covering boxes
+    // FIX: Convert the page text to lowercase before searching
+    const pageTextLower = pageData.searchableText.toLowerCase();
+    
+    while ((matchIdx = pageTextLower.indexOf(normalizedQuery, startIndex)) > -1) {
+      
+      let matchBoxes = [];
       for (let i = 0; i < normalizedQuery.length; i++) {
-        const charBox = pageData.mapping[matchIdx + i];
-        if (!currentRect) {
-          currentRect = { x: charBox.x, y: charBox.y, width: charBox.width, height: charBox.height };
+        matchBoxes.push(pageData.mapping[matchIdx + i]);
+      }
+
+      let matchRects = [];
+      let currentLineBoxes = [];
+      let currentY = null;
+
+      matchBoxes.forEach(box => {
+        if (currentY === null) {
+          currentY = box.y;
+          currentLineBoxes.push(box);
         } else {
-          // If the character is on the same line (Y diff < 5)
-          if (Math.abs(currentRect.y - charBox.y) < 5) {
-            const newMaxX = Math.max(currentRect.x + currentRect.width, charBox.x + charBox.width);
-            currentRect.x = Math.min(currentRect.x, charBox.x);
-            currentRect.width = newMaxX - currentRect.x;
-            currentRect.height = Math.max(currentRect.height, charBox.height);
+          if (Math.abs(currentY - box.y) < 10) {
+            currentLineBoxes.push(box);
           } else {
-            // New line, save the old rect and start a new one
-            matchRects.push(currentRect);
-            currentRect = { x: charBox.x, y: charBox.y, width: charBox.width, height: charBox.height };
+            matchRects.push(mergeBoxes(currentLineBoxes));
+            currentLineBoxes = [box];
+            currentY = box.y;
           }
         }
-      }
-      if (currentRect) matchRects.push(currentRect);
-
-      currentMatches.push({
-        pageNum: pageData.pageNum,
-        rects: matchRects
       });
+      
+      if (currentLineBoxes.length > 0) {
+        matchRects.push(mergeBoxes(currentLineBoxes));
+      }
+
+      currentMatches.push({ pageNum: pageData.pageNum, rects: matchRects });
       startIndex = matchIdx + 1;
     }
   });
@@ -248,8 +264,8 @@ function drawHighlightsForPage(pageNum) {
   const viewport = pageView.viewport;
 
   pageMatches.forEach(match => {
-    // Loop through all rectangles making up this match
     match.rects.forEach(rect => {
+      if (!rect) return;
       const pt = viewport.convertToViewportPoint(rect.x, rect.y);
       const scaledWidth = rect.width * viewport.scale;
       const scaledHeight = rect.height * viewport.scale;
@@ -278,7 +294,7 @@ render();
 }
 
 export default function App() {
-  // usePreventScreenCapture();
+  usePreventScreenCapture();
   const [viewerUri, setViewerUri] = useState("");
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -290,13 +306,60 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        console.log("[GrammarApp] Downloading PDF...");
         const pdfUri = `${FileSystem.cacheDirectory}grammar-document.pdf`;
-        await FileSystem.downloadAsync(PDF_URL, pdfUri);
+        
+        // Check if file already exists in cache
+        const fileInfo = await FileSystem.getInfoAsync(pdfUri);
+        if (!fileInfo.exists) {
+          console.log("[GrammarApp] Downloading PDF...");
+          await FileSystem.downloadAsync(PDF_URL, pdfUri);
+          console.log("[GrammarApp] PDF downloaded and cached:", pdfUri);
+        } else {
+          console.log("[GrammarApp] Using cached PDF:", pdfUri);
+        }
+        
         const viewerUri = `${FileSystem.cacheDirectory}pdf-viewer.html`;
         await FileSystem.writeAsStringAsync(viewerUri, createViewerHtml(pdfUri), { encoding: FileSystem.EncodingType.UTF8 });
-        console.log("[GrammarApp] PDF cached:", pdfUri);
         setViewerUri(viewerUri);
+        
+        // Background check for updates if internet is available
+        (async () => {
+          try {
+            const state = await NetInfo.fetch();
+            if (state.isConnected) {
+              console.log("[GrammarApp] Checking for updates...");
+              const tempUri = `${FileSystem.cacheDirectory}grammar-document-temp.pdf`;
+              
+              await FileSystem.downloadAsync(PDF_URL, tempUri);
+              const tempInfo = await FileSystem.getInfoAsync(tempUri);
+              const cachedInfo = await FileSystem.getInfoAsync(pdfUri);
+              
+              // Compare file sizes to detect changes
+              if (tempInfo.exists && cachedInfo.exists && "size" in tempInfo && "size" in cachedInfo) {
+                const tempSize = (tempInfo as any).size;
+                const cachedSize = (cachedInfo as any).size;
+                
+                if (tempSize !== cachedSize) {
+                  console.log("[GrammarApp] PDF update detected. Replacing cached file...");
+                  await FileSystem.moveAsync({ from: tempUri, to: pdfUri });
+                  // Reload viewer HTML to use updated PDF
+                  await FileSystem.writeAsStringAsync(viewerUri, createViewerHtml(pdfUri), { encoding: FileSystem.EncodingType.UTF8 });
+                } else {
+                  console.log("[GrammarApp] PDF is up to date");
+                  // Clean up temp file
+                  await FileSystem.deleteAsync(tempUri).catch(() => {});
+                }
+              } else {
+                console.log("[GrammarApp] Could not compare file sizes");
+                // Clean up temp file
+                await FileSystem.deleteAsync(tempUri).catch(() => {});
+              }
+            }
+          } catch (error) {
+            console.log("[GrammarApp] Background update check failed:", error);
+          }
+        })();
+        
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
         console.error("[GrammarApp] PDF load failed:", message);
@@ -335,7 +398,13 @@ export default function App() {
     <SafeAreaView style={{ flex: 1 }}>
       <View style={{ backgroundColor: "#1565C0", padding: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
         <Text style={{ color: "white", fontSize: 20, fontWeight: "bold" }}>Contact: 8247829025</Text>
-        <TouchableOpacity onPress={() => setShowSearch(!showSearch)}>
+        <TouchableOpacity onPress={() => {
+          if (showSearch) {
+            setQuery("");
+            webRef.current?.injectJavaScript(`window.search("");true;`);
+          }
+          setShowSearch(!showSearch);
+        }}>
           <MaterialIcons name={showSearch ? "close" : "search"} color="white" size={28} />
         </TouchableOpacity>
       </View>

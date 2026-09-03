@@ -3,7 +3,7 @@
     "name": "GrammarApp",
     "slug": "GrammarApp",
     "version": "1.0.0",
-    "orientation": "portrait",
+    "orientation": "sensor",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
