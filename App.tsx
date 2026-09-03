@@ -6,8 +6,47 @@ import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { usePreventScreenCapture } from "expo-screen-capture";
 import * as FileSystem from "expo-file-system/legacy";
 import NetInfo from "@react-native-community/netinfo";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getApp } from "@react-native-firebase/app";
+import { getAuth, signInAnonymously } from "@react-native-firebase/auth";
+import { get, getDatabase, ref, runTransaction } from "@react-native-firebase/database";
 
 const PDF_URL = "https://drive.google.com/uc?export=download&confirm=t&id=1ttnTzgZEobC2_zmWLvhL7AKiNbgRh-P5";
+const DATABASE_URL = "https://doclocker-ab9b8-default-rtdb.asia-southeast1.firebasedatabase.app";
+const ACTIVATION_KEY = "grammar-app-activation-phone";
+
+function normalizePhoneNumber(value: string) {
+  return value.replace(/\D/g, "").replace(/^0+/, "");
+}
+
+async function refreshCachedPdf(pdfUri: string) {
+  const localInfo = await FileSystem.getInfoAsync(pdfUri, { md5: true });
+  const network = await NetInfo.fetch();
+
+  if (!localInfo.exists) {
+    if (network.isConnected !== true) throw new Error("Connect to the internet for the first document download.");
+    await FileSystem.downloadAsync(PDF_URL, pdfUri);
+    return false;
+  }
+
+  if (network.isConnected !== true) return false;
+
+  const tempUri = `${FileSystem.cacheDirectory}grammar-document-update.pdf`;
+  try {
+    await FileSystem.deleteAsync(tempUri, { idempotent: true });
+    await FileSystem.downloadAsync(PDF_URL, tempUri);
+    const remoteInfo = await FileSystem.getInfoAsync(tempUri, { md5: true });
+    if (remoteInfo.exists && remoteInfo.md5 !== localInfo.md5) {
+      await FileSystem.deleteAsync(pdfUri, { idempotent: true });
+      await FileSystem.moveAsync({ from: tempUri, to: pdfUri });
+      return true;
+    }
+  } finally {
+    await FileSystem.deleteAsync(tempUri, { idempotent: true });
+  }
+
+  return false;
+}
 
 function createViewerHtml(pdfUri: string) {
   return `<!doctype html>
@@ -529,6 +568,11 @@ render();
 
 export default function App() {
   usePreventScreenCapture();
+  const [firebaseUser, setFirebaseUser] = useState<{ uid: string } | null>(null);
+  const [isAuthorized, setIsAuthorized] = useState(false);
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [viewerUri, setViewerUri] = useState("");
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -536,26 +580,99 @@ export default function App() {
   const [showSearch, setShowSearch] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(148); // default fallback
+  const [viewerRevision, setViewerRevision] = useState(0);
   const webRef = useRef<WebView>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    const firebaseAuth = getAuth();
+    if (firebaseAuth.currentUser) {
+      setFirebaseUser(firebaseAuth.currentUser);
+    } else {
+      signInAnonymously(firebaseAuth)
+        .then(({ user }) => setFirebaseUser(user))
+        .catch((cause: unknown) => setLoginError(cause instanceof Error ? cause.message : String(cause)));
+    }
+
+    AsyncStorage.getItem(ACTIVATION_KEY).then((storedPhone) => {
+      if (storedPhone) {
+        setPhoneNumber(storedPhone);
+        setIsAuthorized(true);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseUser || !isAuthorized) return;
+
     (async () => {
       try {
         const pdfUri = `${FileSystem.cacheDirectory}grammar-document.pdf`;
         const fileInfo = await FileSystem.getInfoAsync(pdfUri);
-        if (!fileInfo.exists) {
-          await FileSystem.downloadAsync(PDF_URL, pdfUri);
-        }
+        const hasCachedPdf = fileInfo.exists;
+        if (!hasCachedPdf) await refreshCachedPdf(pdfUri);
         
         const viewerUri = `${FileSystem.cacheDirectory}pdf-viewer.html`;
         await FileSystem.writeAsStringAsync(viewerUri, createViewerHtml(pdfUri), { encoding: FileSystem.EncodingType.UTF8 });
         setViewerUri(viewerUri);
+
+        if (hasCachedPdf) {
+          refreshCachedPdf(pdfUri).then(async (updated) => {
+            if (!updated) return;
+            await FileSystem.writeAsStringAsync(viewerUri, createViewerHtml(pdfUri), { encoding: FileSystem.EncodingType.UTF8 });
+            setViewerRevision((revision) => revision + 1);
+          }).catch(() => {});
+        }
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : String(cause));
       }
     })();
-  }, []);
+  }, [firebaseUser, isAuthorized]);
+
+  async function login() {
+    const normalizedPhone = normalizePhoneNumber(phoneNumber);
+    if (!normalizedPhone) {
+      setLoginError("Enter a valid phone number.");
+      return;
+    }
+
+    if (!firebaseUser) {
+      setLoginError("Connecting securely. Try again in a moment.");
+      return;
+    }
+
+    setIsLoggingIn(true);
+    setLoginError("");
+
+    try {
+      const reference = ref(getDatabase(getApp(), DATABASE_URL), `approvedNumbers/${normalizedPhone}`);
+      const existing = await get(reference);
+      if (!existing.exists() || existing.val()?.enabled !== true) {
+        setLoginError("This phone number is not approved.");
+        return;
+      }
+
+      const result = await runTransaction(reference, (record: { enabled?: boolean; deviceId?: string; [key: string]: unknown } | null) => {
+        if (!record || record.enabled !== true) return record;
+        if (record.deviceId && record.deviceId !== firebaseUser.uid) return record;
+        return { ...record, deviceId: firebaseUser.uid };
+      });
+
+      const record = result.snapshot.val();
+      if (result.committed && record?.deviceId === firebaseUser.uid) {
+        await AsyncStorage.setItem(ACTIVATION_KEY, normalizedPhone);
+        setLoginError("");
+        setIsAuthorized(true);
+        return;
+      }
+
+      setLoginError("This number is already active on another phone.");
+    } catch (cause) {
+      setLoginError(cause instanceof Error ? `Could not verify access: ${cause.message}` : "Could not verify access. Check Firebase settings and your internet connection.");
+    } finally {
+      setIsLoggingIn(false);
+    }
+  }
 
   function search(value: string) {
     setQuery(value);
@@ -571,9 +688,25 @@ export default function App() {
 
 
 
-  if (error) return <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 24 }}><Text style={{ color: "#b00020" }}>{error}</Text></View>;
+  if (!firebaseUser) return <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 24 }}><ActivityIndicator size="large" /><Text style={{ marginTop: 12 }}>Connecting...</Text>{loginError ? <Text style={{ color: "#b00020", marginTop: 12 }}>{loginError}</Text> : null}</View>;
+  if (!isAuthorized) return (
+    <View style={{ flex: 1, justifyContent: "center", padding: 24 }}>
+      <Text style={{ fontSize: 26, fontWeight: "bold", marginBottom: 10 }}>Enter your phone number</Text>
+      <Text style={{ color: "#555", marginBottom: 18 }}>Use the number you gave us when you paid.</Text>
+      <TextInput
+        value={phoneNumber}
+        onChangeText={setPhoneNumber}
+        keyboardType="phone-pad"
+        placeholder="Phone number"
+        style={{ borderWidth: 1, borderColor: "#aaa", padding: 14, fontSize: 18, marginBottom: 12 }}
+      />
+      <TouchableOpacity onPress={login} disabled={isLoggingIn} style={{ backgroundColor: "#1565C0", padding: 15, alignItems: "center" }}>
+        {isLoggingIn ? <ActivityIndicator color="white" /> : <Text style={{ color: "white", fontSize: 17, fontWeight: "bold" }}>Login</Text>}
+      </TouchableOpacity>
+      {loginError ? <Text style={{ color: "#b00020", marginTop: 14 }}>{loginError}</Text> : null}
+    </View>
+  );
   if (!viewerUri) return <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}><ActivityIndicator size="large" /><Text style={{ marginTop: 12 }}>Loading document...</Text></View>;
-
   return (
     <SafeAreaView style={{ flex: 1 }}>
       <View style={{ backgroundColor: "#1565C0", padding: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
@@ -598,6 +731,7 @@ export default function App() {
       )}
       
       <WebView 
+        key={viewerRevision}
         ref={webRef} 
         source={{ uri: viewerUri }} 
         originWhitelist={["*"]} 
